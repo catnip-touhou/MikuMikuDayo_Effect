@@ -1,2 +1,2 @@
 # MikuMikuDayo_Effect
-MikuMikuDayo用に作ったエフェクトを置いておくリポジトリ
+MikuMikuDayo用に作った/改造したエフェクトを置いておくリポジトリ
