@@ -1,0 +1,176 @@
+[YRZFX]
+{
+    "fx": {
+        "cereal_class_version": 0,
+		"category" : "postprocess",
+        "controllers": [{"name": "C_off","controllerName": "(self)","item": "off","type": "float"}],
+		"textures":[
+			{ "name":"GlareSource", "format": "R16G16B16A16_FLOAT", "view":"RTV"},
+			{ "name":"GlareX0","format": "R16G16B16A16_FLOAT", "view":"RTV", "size":{"ratio":{"x":1,"y":1}}},
+			{ "name":"GlareX1","format": "R16G16B16A16_FLOAT", "view":"RTV", "size":{"ratio":{"x":0.5,"y":0.5}}},
+			{ "name":"GlareX2","format": "R16G16B16A16_FLOAT", "view":"RTV", "size":{"ratio":{"x":0.25,"y":0.25}}},
+			{ "name":"GlareX3","format": "R16G16B16A16_FLOAT", "view":"RTV", "size":{"ratio":{"x":0.125,"y":0.125}}},
+			{ "name":"GlareX4","format": "R16G16B16A16_FLOAT", "view":"RTV", "size":{"ratio":{"x":0.0625,"y":0.0625}}},
+			{ "name":"GlareX5","format": "R16G16B16A16_FLOAT", "view":"RTV", "size":{"ratio":{"x":0.03125,"y":0.03125}}},
+			{ "name":"GlareY0","format": "R16G16B16A16_FLOAT", "view":"RTV", "size":{"ratio":{"x":1,"y":1}}},
+			{ "name":"GlareY1","format": "R16G16B16A16_FLOAT", "view":"RTV", "size":{"ratio":{"x":0.5,"y":0.5}}},
+			{ "name":"GlareY2","format": "R16G16B16A16_FLOAT", "view":"RTV", "size":{"ratio":{"x":0.25,"y":0.25}}},
+			{ "name":"GlareY3","format": "R16G16B16A16_FLOAT", "view":"RTV", "size":{"ratio":{"x":0.125,"y":0.125}}},
+			{ "name":"GlareY4","format": "R16G16B16A16_FLOAT", "view":"RTV", "size":{"ratio":{"x":0.0625,"y":0.0625}}},
+			{ "name":"GlareY5","format": "R16G16B16A16_FLOAT", "view":"RTV", "size":{"ratio":{"x":0.03125,"y":0.03125}}}
+		],
+		"samplers": [
+			{ "name":"ClampSamp", "filter":"LINEAR", "addressU":"CLAMP", "addressV":"CLAMP" },
+			{ "name":"BorderSamp", "filter":"LINEAR", "addressU":"BORDER", "addressV":"BORDER", "borderColor":"TRANSPARENT_BLACK" }
+		],
+        "passes": [
+			{ "name":"Setup", "type":"postprocess", "vertexShader":"VS", "pixelShader":"PS", "RTV":[ {"name":"GlareSource"}]},
+
+			{ "name":"BlurX0", "type":"postprocess", "vertexShader":"VS", "pixelShader":"PS", "RTV":[ {"name":"GlareX0" }],
+				"macros":[ "BLUR_SRC=GlareSource", "UNIOFS=float2(1,0)" ]},
+			{ "name":"BlurY0", "type":"postprocess", "vertexShader":"VS", "pixelShader":"PS", "RTV":[ {"name":"GlareY0" }],
+				"macros":[ "BLUR_SRC=GlareX0", "UNIOFS=float2(0,1)" ]},
+
+			{ "name":"BlurX1", "type":"postprocess", "vertexShader":"VS", "pixelShader":"PS", "RTV":[ {"name":"GlareX1" }],
+				"macros":[ "BLUR_SRC=GlareY0", "UNIOFS=float2(1,0)" ]},
+			{ "name":"BlurY1", "type":"postprocess", "vertexShader":"VS", "pixelShader":"PS", "RTV":[ {"name":"GlareY1" }],
+				"macros":[ "BLUR_SRC=GlareX1", "UNIOFS=float2(0,1)" ]},
+
+			{ "name":"BlurX2", "type":"postprocess", "vertexShader":"VS", "pixelShader":"PS", "RTV":[ {"name":"GlareX2" }],
+				"macros":[ "BLUR_SRC=GlareY1", "UNIOFS=float2(1,0)" ]},
+			{ "name":"BlurY2", "type":"postprocess", "vertexShader":"VS", "pixelShader":"PS", "RTV":[ {"name":"GlareY2" }],
+				"macros":[ "BLUR_SRC=GlareX2", "UNIOFS=float2(0,1)" ]},
+
+			{ "name":"BlurX3", "type":"postprocess", "vertexShader":"VS", "pixelShader":"PS", "RTV":[ {"name":"GlareX3" }],
+				"macros":[ "BLUR_SRC=GlareY2", "UNIOFS=float2(1,0)" ]},
+			{ "name":"BlurY3", "type":"postprocess", "vertexShader":"VS", "pixelShader":"PS", "RTV":[ {"name":"GlareY3" }],
+				"macros":[ "BLUR_SRC=GlareX3", "UNIOFS=float2(0,1)" ]},
+
+			{ "name":"BlurX4", "type":"postprocess", "vertexShader":"VS", "pixelShader":"PS", "RTV":[ {"name":"GlareX4" }],
+				"macros":[ "BLUR_SRC=GlareY3", "UNIOFS=float2(1,0)" ]},
+			{ "name":"BlurY4", "type":"postprocess", "vertexShader":"VS", "pixelShader":"PS", "RTV":[ {"name":"GlareY4" }],
+				"macros":[ "BLUR_SRC=GlareX4", "UNIOFS=float2(0,1)" ]},
+
+			{ "name":"BlurX5", "type":"postprocess", "vertexShader":"VS", "pixelShader":"PS", "RTV":[ {"name":"GlareX5" }],
+				"macros":[ "BLUR_SRC=GlareY4", "UNIOFS=float2(1,0)" ]},
+			{ "name":"BlurY5", "type":"postprocess", "vertexShader":"VS", "pixelShader":"PS", "RTV":[ {"name":"GlareY5" }],
+				"macros":[ "BLUR_SRC=GlareX5", "UNIOFS=float2(0,1)" ]},
+
+			{ "name":"Compose", "type":"postprocess", "vertexShader":"VS", "pixelShader":"PS"}
+		]
+    }
+}
+[HLSL]
+#include "../../hlsl/resources_pp.hlsli"
+#include "../../hlsl/yrz.hlsli"
+using namespace Dayo;
+using namespace YRZ;
+
+struct VSO {
+	float4 pos : SV_POSITION;
+	float2 uv : TEXCOORD0;
+};
+
+VSO VS( float4 pos : POSITION, float2 uv : TEXCOORD ) {
+	VSO o;
+	o.pos = pos;
+	o.uv = uv;
+	return o;
+}
+
+#ifdef BLUR_SRC
+float4 PS(VSO vso) : SV_TARGET0
+{
+	uint W,H;
+	BLUR_SRC.GetDimensions(W,H);
+	const int N = 32;
+	float ofs = N/2-0.5;
+	float2 e = float2(AspectRatio,1) / float2(W,H) * UNIOFS;
+	float2 uv = vso.uv;
+	//e = rot2(e, acsRx) / Resolution;
+	float3 BlurColor = 1;
+
+	float3 tt=0;
+	float tw=0;
+	for (int i=0; i < N; i++)
+    {
+		float d = (i-ofs);
+		float2 sp = uv + d * e;
+		float3 t = BLUR_SRC.Sample(BorderSamp, sp);
+		//なんかこのチェックいれないとRadeonで真っ黒になったままになったりするので
+		if (any(!isfinite(t)))
+			continue;
+
+		float3 g;
+		float b = d * dot(float2(1,1/AspectRatio), UNIOFS);
+		//色調整入りガウシアン
+		g = float3(exp(-b*b/N*BlurColor.r)*BlurColor.r,exp(-b*b/N*BlurColor.g)*BlurColor.g,exp(-b*b/N*BlurColor.b)*BlurColor.b);
+		
+		tw += dot(g,float3(0.3,0.6,0.1)) ;	
+		tt += g * t;
+    }
+	return (tw>0) ? float4(tt/tw,1) : 0;
+}
+#endif
+
+//セットアップ
+#ifdef YRZ_PASS_Setup
+float4 PS(VSO vso) : SV_TARGET0
+{
+	float4 Color;
+	
+	//<<高輝度抽出>>
+	// メインレンダリングターゲットからカラーをサンプリング
+	Color = ScreenTexture.Sample(ClampSamp, vso.uv);
+
+	// サンプリングしたカラーの明るさを計算
+    float Lt = dot(Color.xyz, float3(0.2125f, 0.7154f, 0.0721f));
+
+    // 高輝度領域はそのまま, 低輝度領域は黒透明にする.
+	if((Lt - 1.0f) < 0.0f ) {
+		// 高輝度領域はそのまま, 低輝度領域は黒透明にする.
+		Color.rgb *= 0.0f;
+		Color.a = 0.0f;
+	}
+
+	return Color;
+}
+#endif
+
+//コンポジット
+#ifdef YRZ_PASS_Compose
+
+float3 GatherGlare(float2 uv)
+{
+	float3 Color = GlareY0.Sample(BorderSamp, uv).rgb;
+	Color.rgb += GlareY1.Sample(BorderSamp, uv).rgb;
+	Color.rgb += GlareY2.Sample(BorderSamp, uv).rgb;
+	Color.rgb += GlareY3.Sample(BorderSamp, uv).rgb;
+	Color.rgb += GlareY4.Sample(BorderSamp, uv).rgb;
+	Color.rgb += GlareY5.Sample(BorderSamp, uv).rgb;
+	Color.rgb *= 1.0/30;
+	return Color;
+}
+
+float4 PS(VSO vso) : SV_TARGET0
+{
+	float4 I = ScreenTexture.Sample(ClampSamp, vso.uv);
+	float4 O = I;
+	
+
+	O.rgb = I.rgb + GatherGlare(vso.uv);
+
+	/* 彩度が落ちたり色転びするのを防ぐコード */
+	/*
+	float3 hsvI = RGBtoHSV(I.rgb);
+	float3 hsvO = RGBtoHSV(O.rgb);
+	hsvO.xy = hsvI.xy;
+	O.rgb = HSVtoRGB(float3(hsvO));
+	*/
+
+	O.a = I.a;
+	return O;
+}
+
+
+#endif
