@@ -1,0 +1,212 @@
+[YRZFX]
+{
+    "fx": {
+        "cereal_class_version": 0,
+		"category" : "postprocess",
+		"controllers": [
+    		{"name": "C_off","controllerName": "(self)","item": "off","type": "float"},
+    		{"name": "C_mode","controllerName": "(self)","item": "mode","type": "float"},
+    		{"name": "C_bg","controllerName": "(self)","item": "bg","type": "float"},
+    		{"name": "C_Rx","controllerName": "(self)","item": "Rx","type": "float"},
+    		{"name": "C_Ry","controllerName": "(self)","item": "Ry","type": "float"},
+    		{"name": "C_Rz","controllerName": "(self)","item": "Rz","type": "float"},
+    	],
+		"samplers": [
+			{ "name":"ClampSamp", "filter":"LINEAR", "addressU":"CLAMP", "addressV":"CLAMP" },
+		],
+        "passes": [
+			{ "name":"EquirectangularPass", "type":"postprocess", "vertexShader":"VS", "pixelShader":"PS"},
+		]
+    }
+}
+[HLSL]
+#include "../../hlsl/resources_pp.hlsli"
+#include "../../hlsl/yrz.hlsli"
+using namespace Dayo;
+using namespace YRZ;
+
+struct VSO {
+	float4 pos : SV_POSITION;
+	float2 uv : TEXCOORD0;
+};
+
+VSO VS( float4 pos : POSITION, float2 uv : TEXCOORD ) {
+	VSO o;
+	o.pos = pos;
+	o.uv = uv;
+	return o;
+}
+
+//変換処理
+#ifdef YRZ_PASS_EquirectangularPass
+
+static float pi=3.1415926535;
+
+float4 PS(VSO vso) : SV_TARGET0
+{
+	float3 CameraDirection;
+	float theta_delta;
+	float phi_delta2;
+	float flg_mode;
+	float flg_back;
+	float theta_delta2;
+	float phi_delta;
+	float z_angl;
+
+	float4 Color;
+	float2 tex_conv;
+
+	float theta;			//仰俯角
+	float phi;				//方位角
+	float width;
+	float width360;
+	float dmmin_x, dmmax_x;	// 変換元範囲(X座標のみ)
+	
+	CameraDirection = CameraForward;
+	theta_delta = -asin(CameraDirection.y);
+	phi_delta2 = (step(CameraDirection.z,0.0)*-2+1.0)*acos(CameraDirection.x);
+	flg_mode = 10.0 - C_mode * 10.0;	// Si, ただし, 0.0:180[deg]mode, 1.0:360[deg]mode
+	flg_back = C_bg;					// Tr
+	theta_delta2 = C_Rx * 1.0 * pi;		// Rx
+	phi_delta = C_Ry * 1.0 * pi;		// Ry
+	z_angl = C_Rz * 0.5 * pi;			// Rz
+	width360 = clamp(flg_mode*0.1,0.0,0.25);
+	
+	//モードにより切替え
+	if( flg_mode > 7 ){
+		//完全固定モードか(Rz>45?)
+		if( z_angl*180/pi > 45){
+			theta_delta = theta_delta2;	//完全固定モードの場合は仰俯角にカメラ角ではなくRx角を使う
+		}
+		//180度モード→方位角手動のみ＋内部方位角基準-90、幅変更
+		width = 2.0;
+		phi = -90 + phi_delta*180/pi;							//方位角
+		theta = theta_delta*180.0/pi;							//仰俯角
+		dmmin_x = 0.0;
+		dmmax_x = 1.0;
+	}
+	else if( flg_mode > 3 ){
+		//完全固定モードか(Rz>45?)
+		if( z_angl*180/pi > 45){
+			theta_delta = theta_delta2;	//完全固定モードの場合は仰俯角にカメラ角ではなくRx角を使う
+		}
+		//180度モード→方位角手動＋カメラ＋内部方位角基準、幅変更
+		width = 2.0;
+		phi = (phi_delta-phi_delta2)*180/pi;					//方位角
+		theta = theta_delta*180.0/pi;							//仰俯角
+		dmmin_x = 0.0;
+		dmmax_x = 1.0;
+	}
+	else{
+		//完全固定モードか(Rz>45?)
+		if( z_angl*180/pi > 45){
+			//360度モード→方位角手動＋カメラ＋内部方位角基準+90
+			width = 1.0;
+			phi = 0 + phi_delta*180/pi;								//方位角
+			theta = theta_delta2*180.0/pi;							//仰俯角
+			dmmin_x = 0.25 - width360;								//通常は正面の正方形のみを利用
+			dmmax_x = 0.75 + width360;								//Siの値次第で切り欠きを解除
+		}
+		else{
+			//360度モード→方位角手動＋カメラ＋内部方位角基準+90
+			width = 1.0;
+			phi = 90 + (phi_delta-phi_delta2)*180/pi;				//方位角
+			theta = theta_delta*180.0/pi;							//仰俯角
+			dmmin_x = 0.25 - width360;								//通常は正面の正方形のみを利用
+			dmmax_x = 0.75 + width360;								//Siの値次第で切り欠きを解除
+		}
+	}
+	float4 back_col;
+	if( flg_back < 0.5 ){
+		back_col = float4(0,0,0,1);
+	}
+	else{
+		back_col = float4(0,1.0,0,1);
+	}
+
+	float sin_theta=sin(theta*pi/180.0);
+	float cos_theta=cos(theta*pi/180.0);
+	float sin_phi=sin(phi*pi/180.0);
+	float cos_phi=cos(phi*pi/180.0);
+	
+	float car_x, car_y, car_z;		// 回転操作後の単位ベクトル
+	float tmp_x, tmp_y, tmp_z;		// 作業用ベクトル
+	float tmp2_x, tmp2_y, tmp2_z;
+	float dm_theta, dm_phi;			// 変換元または変換先の極座標
+	float dm_x, dm_y;				// 変換先の座標
+	float dmsrc_x, dmsrc_y;			// 変換元の対応位置
+	float sin_dm_theta, cos_dm_theta, sin_dm_phi, cos_dm_phi;
+
+	dm_x = vso.uv.x;
+	dm_y = vso.uv.y;
+
+	//dm_theta=pi*(float)dm_y/(float)(dm_h-1);	//←dm_hは元コードでは縦ピクセル数だがテクスチャ座標は0.0～1.0なので置き換える
+	dm_theta=pi*(float)dm_y;
+	sin_dm_theta=sin(dm_theta);
+	cos_dm_theta=cos(dm_theta);
+	
+	//dm_phi=2*pi*dm_x/((float)dm_w);	//←dm_wは元コードでは横ピクセル数だがテクスチャ座標は0.0～1.0なので置き換える
+//	dm_phi=2*pi*dm_x;
+	dm_phi=2*pi*dm_x/width;
+	sin_dm_phi=sin(dm_phi);
+	cos_dm_phi=cos(dm_phi);
+	
+	// 変換先の正距円筒図法ピクセル座標の極座標値に対応する直交座標の単位ベクトル生成
+	tmp2_x = sin_dm_theta*cos_dm_phi;
+	tmp2_y = sin_dm_theta*-sin_dm_phi;
+	tmp2_z = cos_dm_theta;
+	
+	// ベクトルの回転操作
+	// Z軸回転（方位角）
+	tmp_x=tmp2_x*cos_phi-tmp2_y*sin_phi;
+	tmp_y=tmp2_x*sin_phi+tmp2_y*cos_phi;
+	tmp_z=tmp2_z;
+	// Y軸回転（仰角）
+//	tmp2_x=tmp_x*cos_theta+tmp_z*sin_theta;
+//	tmp2_y=tmp_y;
+//	tmp2_z=-tmp_x*sin_theta+tmp_z*cos_theta;
+	
+//	car_x=tmp2_z;
+//	car_y=tmp2_y;
+//	car_z=-tmp2_x;
+	
+	car_x=-tmp_x*sin_theta+tmp_z*cos_theta;
+	car_y=tmp_y;
+	car_z=(tmp_x*cos_theta+tmp_z*sin_theta)*(-1);
+	
+	dm_theta=acos(car_z);
+	if(car_y>0) dm_phi=atan(car_x/car_y);
+	else if(car_y<0) dm_phi=pi-atan(car_x/-car_y);
+	else if(car_y==0 && car_x>0) dm_phi=pi/2.0;
+	else if(car_y==0 && car_x<0) dm_phi=-pi/2.0;
+	else dm_phi=0; // if(car_y==0 && car_x==0)
+	
+	float angle_in = atan(1 / ProjectionMatrix._11) * 2;	//flogeyeのコードから拝借
+//	float angle_in = pi/2;
+
+	// 変換元のピクセル座標の算出
+	if(dm_theta<=pi/2){
+//		dmsrc_x=(tan(dm_theta)*cos(-dm_phi)/(2.0*tan(angle_in*pi/360))+0.5)*(float)fpip->w;
+//		dmsrc_y=(tan(dm_theta)*sin(-dm_phi)/(2.0*tan(((float)fpip->h/(float)fpip->w)*angle_in*pi/360))+0.5)*(float)fpip->h;
+		//↑は元コード。fpip->h等を全て1.0に置き換えて省いている
+		dmsrc_x=(tan(dm_theta)*cos(-dm_phi)/(2.0*tan(angle_in/2))+0.5);
+		dmsrc_y=(tan(dm_theta)*sin(-dm_phi)/(2.0*tan(angle_in/2)*width*0.5)+0.5);
+		
+		if( dmsrc_x >= dmmin_x && dmsrc_y >= 0 && dmsrc_x <= dmmax_x && dmsrc_y <= 1.0){
+			tex_conv.x = dmsrc_x;
+			tex_conv.y = dmsrc_y;
+			Color = ScreenTexture.Sample(ClampSamp, tex_conv);	// 2Dテクスチャをサンプリングします
+		}
+		else{
+			tex_conv.x = dm_x;
+			tex_conv.y = dm_y;
+			Color = back_col;
+		}
+	}
+	else{
+		Color = back_col;
+	}
+
+	return Color;
+}
+#endif
