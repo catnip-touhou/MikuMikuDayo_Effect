@@ -1,0 +1,229 @@
+// desc: アニメ調向けエッジ
+//
+// ==================================================================================
+//   【 アニメ調エッジ 使用マニュアル 】
+// ==================================================================================
+//
+// ■ 概要
+//   MikuMikuDayoの「G-Buffer(幾何情報)」を利用して、アニメのような輪郭線を検出します。
+//   通常の画像処理とは異なり、「モデルID」「深度」「法線」を見るため、正確なフチ抽出が可能です。
+//   「顔のパーツ(目や口)に不要な線が出る問題」に対策したロジックを搭載しています。
+//
+// ■ 使いこなしのコツ (重要！)
+//
+//   1. 【目・口の線を消す】
+//      FXLinkerのUIで、「目」や「口内」「舌」などの材質のチェックを【外して】ください。
+//      このエフェクトは「チェックが外れている材質との境界には線を引かない」という特殊な判定をしています。
+//      これにより、アイラインや唇のテクスチャを邪魔する二重線を防げます。
+//
+//   2. 【鼻やシワを消す】
+//      「Si (CenterMask)」モーフを 0.2 ～ 0.5 くらいまで上げてください。
+//      これは「カメラを向いている面(顔の正面)」のエッジを弱める機能です。
+//      輪郭(横を向いている面)は残しつつ、鼻の穴や法令線などのノイズだけを消せます。
+//
+//   3. 【感度調整の基本】
+//      基本は「X (EdgeWidth)」で全体の線の出やすさを決めます。
+//      髪の毛の重なりを出したいときは「Y (DepthSens)」を上げ、
+//      箱やメカの角を出したいときは「Z (NormalSens)」を上げてください。
+//
+// ==================================================================================
+//   【 パラメータ(モーフ) 詳細解説 】
+// ==================================================================================
+//
+// @morph: Si = CenterMask
+//   [正面マスク強度] (0.0 ～ 1.0)
+//   値を上げると、「カメラと正対している面」のエッジ検出力を弱めます。
+//   顔の正面にある鼻や口の凹凸による線を消すのに役立ちます。
+//
+// @morph: X = EdgeWidth
+//   [エッジ幅 / 検出閾値] (0.0 ～ 1.0)
+//   線の「太さ」兼「出やすさ」を制御します。
+//   0.0付近: 非常に強い段差にしか線が出ません(線が細く、途切れやすくなる)。
+//   1.0付近: わずかな凹凸でも線が出ます(線が太く、濃くなる)。
+//
+// @morph: Y = DepthSens
+//   [深度感度] (0.0 ～ 1.0)
+//   「前後の奥行き」に対する敏感さです。
+//   値を上げる -> 手と体、髪の毛束の重なりなど「前後関係がある場所」に線が出ます。
+//
+// @morph: Z = NormalSens
+//   [法線感度] (0.0 ～ 1.0)
+//   「面の折れ曲がり」に対する敏感さです。
+//   値を上げる -> 鼻筋、指の関節、メカの角など「角度が急な場所」に線が出ます。
+//
+// @morph: Rx = EdgeR
+// @morph: Ry = EdgeG
+// @morph: Rz = EdgeB
+//   [線の色] (0.0 ～ 1.0)
+//   線の色(RGB)を指定します。デフォルトは黒(0,0,0)です。
+//
+// @morph: Tr = EdgeAlpha
+//   [線の不透明度] (0.0 ～ 1.0)
+//   1.0でクッキリ、下げると薄くなります。
+//
+// ==================================================================================
+
+// --------------------------------------------------------
+// Pass 0: EdgeGen (CS)
+// 役割: 画面全体を走査し、どこが「エッジ」かを判定してWorkTexに書き込む
+// --------------------------------------------------------
+// @pass: EdgeGen (CS)
+// @write: WorkTex
+#ifdef YRZ_PASS_EdgeGen
+
+// 周囲8ピクセル(上下左右+斜め)を調べるための座標ズレデータ
+static const int2 Offsets[8] = {
+    int2(-1, -1), int2(0, -1), int2(1, -1),
+    int2(-1,  0),              int2(1,  0),
+    int2(-1,  1), int2(0,  1), int2(1,  1)
+};
+
+void CS_EdgeGen(int2 pos)
+{
+    // 1. 初期化 (必須)
+    WorkTex[pos] = float4(0, 0, 0, 0);
+
+    uint w, h;
+    GBuffer1.GetDimensions(w, h);
+
+    // 2. 中心ピクセルの情報を取得
+    // GBuffer1.r : モデルID / NormalDepth.a : 深度 / NormalDepth.rgb : 法線
+    uint2 gbCenter = GBuffer1[pos];
+    float4 ndCenter = NormalDepth[pos];
+    
+    // 背景(Inai)の場合は処理しない
+    if (gbCenter.r == Inai) return;
+
+    // 3. エフェクトON/OFFチェック
+    // FXLinkerのUIでチェックが入っているか確認
+    uint matID_c = Faces[NonUniformResourceIndex(gbCenter.r)][gbCenter.g];
+    uint bits_c = MaterialEffectBits[NonUniformResourceIndex(gbCenter.r)][matID_c];
+    
+    // OFFなら即終了
+    if (!(bits_c & MY_BIT_FLAG)) return;
+
+    // データを使いやすい形に整理
+    float3 N_c = normalize(ndCenter.rgb);
+    float D_c = ndCenter.a;
+    uint ID_c = gbCenter.r;
+
+    // =========================================================
+    //   正面マスク (CenterMask) の計算
+    // =========================================================
+    // 顔のパーツ(目鼻口)は「カメラを向いている(正面)」ことが多い。
+    // 一方、輪郭線は「カメラと直角(横)を向いている」場所に出る。
+    // これを利用して、正面付近のエッジ強度を下げる係数を作る。
+    
+    // ワールド座標を復元して、視線ベクトル(V)を計算
+    float3 worldPos = WorldPosFromDepth(pos, D_c);
+    float3 V = normalize(CameraPosition - worldPos);
+    
+    // NdotV: 1.0に近いほど「カメラと正対している(顔の正面)」
+    float NdotV = saturate(dot(N_c, V));
+
+    // Si(CenterMask)が高いほど、正面付近のエッジを消す力が強くなる
+    float maskThreshold = 1.0 - CenterMask; 
+    // smoothstepでなめらかに係数を作る (0.1～1.0の範囲)
+    float centerMaskFactor = 1.0 - smoothstep(maskThreshold - 0.1, maskThreshold, NdotV);
+    centerMaskFactor = max(0.1, centerMaskFactor); // 完全に0にはしない(最低保証)
+
+    float edgeIntensity = 0.0;
+    
+    // しきい値の計算 (パラメータ適用)
+    float threshDepth = max(0.0001, (1.0 - EdgeWidth) * 0.1); 
+    float threshNormal = max(0.01, (1.0 - NormalSens) * 0.5);
+
+    // 4. 周囲8ピクセルとの比較ループ
+    [unroll]
+    for(int i = 0; i < 8; i++)
+    {
+        int2 samplePos = pos + Offsets[i];
+        if (samplePos.x < 0 || samplePos.y < 0 || samplePos.x >= (int)w || samplePos.y >= (int)h) continue;
+
+        uint2 gbS = GBuffer1[samplePos];
+        float4 ndS = NormalDepth[samplePos];
+
+        // =========================================================
+        //   判定パターン1: IDエッジ (シルエット)
+        // =========================================================
+        // 隣が「自分と違うモデル」の場合
+        if (gbS.r != ID_c) {
+            // 別モデルなら、相手の設定にかかわらず無条件でエッジとする
+            // これにより、キャラと背景(壁や床)の境界線はしっかり描かれます。
+            edgeIntensity = max(edgeIntensity, 1.0);
+            continue; 
+        }
+
+        // =========================================================
+        //   ここから先は「同一モデル (ID_c == gbS.r)」の処理
+        // =========================================================
+        // --- 同一モデル内の「エフェクトOFF材質」対策 ---
+        // 自分はONだが、隣(目や口など)がOFFの場合、
+        // 深度や法線の差があっても線を引かないようにする。
+        {
+            // 隣のピクセルの材質情報を取得
+            // (gbS.r は自分と同じIDなので、NonUniformResourceIndexは不要だが念のため)
+            uint matID_s = Faces[NonUniformResourceIndex(gbS.r)][gbS.g];
+            uint bits_s = MaterialEffectBits[NonUniformResourceIndex(gbS.r)][matID_s];
+
+            // 隣の材質がエフェクトOFFなら、これ以上の計算(深度・法線)をスキップ
+            // -> 結果として、肌と目の境界線が消える
+            if (!(bits_s & MY_BIT_FLAG)) {
+                continue;
+            }
+        }
+
+        // =========================================================
+        //   判定パターン2: 深度エッジ (前後関係)
+        // =========================================================
+        float D_s = ndS.a;
+        float depthDiff = abs(D_c - D_s);
+        
+        // 遠くの物体対策: 距離(D_c)に応じてしきい値を甘くする
+        float scaledThresh = threshDepth * (1.0 + D_c * DepthSens * 10.0);
+        float dEdge = smoothstep(scaledThresh, scaledThresh * 2.0, depthDiff);
+        
+        // ここで正面マスクを適用 (鼻の穴などを消す)
+        edgeIntensity = max(edgeIntensity, dEdge * centerMaskFactor);
+
+        // =========================================================
+        //   判定パターン3: 法線エッジ (角の折れ曲がり)
+        // =========================================================
+        float3 N_s = normalize(ndS.rgb);
+        float dotN = dot(N_c, N_s); 
+        
+        // 角度がついている(内積が小さい)ほどエッジ
+        float nEdge = smoothstep(threshNormal + 0.1, threshNormal, dotN);
+        
+        // ここでも正面マスクを適用 (法令線などを消す)
+        edgeIntensity = max(edgeIntensity, nEdge * centerMaskFactor);
+    }
+
+    // 5. 結果の書き込み (Rチャンネルに強度)
+    WorkTex[pos] = float4(edgeIntensity, 0, 0, 1);
+}
+#endif
+
+// --------------------------------------------------------
+// Pass 1: Composite (PS)
+// 役割: 計算されたエッジ情報を、元の画面に合成して表示
+// --------------------------------------------------------
+// @pass: Composite (PS)
+// @read: WorkTex
+#ifdef YRZ_PASS_Composite
+float4 PS_Composite(VSO vso)
+{
+    float4 col = ScreenTexture.Sample(ClampSamp, vso.uv);
+    float4 edgeData = WorkTex.Sample(ClampSamp, vso.uv);
+
+    float intensity = edgeData.r;
+    float3 edgeColor = float3(EdgeR, EdgeG, EdgeB);
+    
+    // 不透明度(Tr)を適用
+    float alpha = intensity * EdgeAlpha;
+
+    // 線形補間(lerp)で合成
+    // 元の色(col.rgb) と 線の色(edgeColor) を alpha で混ぜる
+    return float4(lerp(col.rgb, edgeColor, alpha), col.a);
+}
+#endif
