@@ -11,15 +11,19 @@
 //
 // ■ 使いこなしのコツ (重要！)
 //
-//   1. 【目・口の線を消す】
+//   1. 【重要】目・口の材質チェックを外す
 //      FXLinkerのUIで、「目」や「口内」「舌」などの材質のチェックを【外して】ください。
-//      このエフェクトは「チェックが外れている材質との境界には線を引かない」という特殊な判定をしています。
+//      このエフェクトは「チェックが外れている材質との境界には線を引かない」という特殊判定をします。
 //      これにより、アイラインや唇のテクスチャを邪魔する二重線を防げます。
 //
-//   2. 【鼻やシワを消す】
-//      「Si (CenterMask)」モーフを 0.2 ～ 0.5 くらいまで上げてください。
+//   2. 鼻やシワを消す (Si: CenterMask)
+//      「Si」モーフを 0.2 ～ 0.5 くらいまで上げてください。
 //      これは「カメラを向いている面(顔の正面)」のエッジを弱める機能です。
 //      輪郭(横を向いている面)は残しつつ、鼻の穴や法令線などのノイズだけを消せます。
+//
+//   3. ジャギーを馴染ませる (S: EdgeSoft)
+//      「S」モーフを 0.3 ～ 0.6 くらいまで上げてください。
+//      検出された線を少しぼかして合成します。
 //
 //   3. 【感度調整の基本】
 //      基本は「X (EdgeWidth)」で全体の線の出やすさを決めます。
@@ -61,6 +65,9 @@
 //   [線の不透明度] (0.0 ～ 1.0)
 //   1.0でクッキリ、下げると薄くなります。
 //
+// @morph: S = EdgeSoft
+//   [ソフトネス] (0.0:硬い ～ 1.0:柔らかい) 
+//       線の輪郭をぼかしてジャギーを低減します。上げすぎると線が太く眠くなります
 // ==================================================================================
 
 // --------------------------------------------------------
@@ -87,19 +94,18 @@ void CS_EdgeGen(int2 pos)
     GBuffer1.GetDimensions(w, h);
 
     // 2. 中心ピクセルの情報を取得
-    // GBuffer1.r : モデルID / NormalDepth.a : 深度 / NormalDepth.rgb : 法線
-    uint2 gbCenter = GBuffer1[pos];
-    float4 ndCenter = NormalDepth[pos];
+    uint2 gbCenter = GBuffer1[pos];      // .r=モデルID, .g=面ID
+    float4 ndCenter = NormalDepth[pos];  // .rgb=法線, .a=深度
     
     // 背景(Inai)の場合は処理しない
     if (gbCenter.r == Inai) return;
 
-    // 3. エフェクトON/OFFチェック
+    // 3. エフェクトON/OFFチェック (自分自身)
     // FXLinkerのUIでチェックが入っているか確認
     uint matID_c = Faces[NonUniformResourceIndex(gbCenter.r)][gbCenter.g];
     uint bits_c = MaterialEffectBits[NonUniformResourceIndex(gbCenter.r)][matID_c];
     
-    // OFFなら即終了
+    // 自分がOFFなら即終了
     if (!(bits_c & MY_BIT_FLAG)) return;
 
     // データを使いやすい形に整理
@@ -108,7 +114,7 @@ void CS_EdgeGen(int2 pos)
     uint ID_c = gbCenter.r;
 
     // =========================================================
-    //   正面マスク (CenterMask) の計算
+    //   ロジックA: 正面マスク (CenterMask) の計算
     // =========================================================
     // 顔のパーツ(目鼻口)は「カメラを向いている(正面)」ことが多い。
     // 一方、輪郭線は「カメラと直角(横)を向いている」場所に出る。
@@ -169,7 +175,7 @@ void CS_EdgeGen(int2 pos)
             // 隣の材質がエフェクトOFFなら、これ以上の計算(深度・法線)をスキップ
             // -> 結果として、肌と目の境界線が消える
             if (!(bits_s & MY_BIT_FLAG)) {
-                continue;
+                continue; // スキップ
             }
         }
 
@@ -179,7 +185,7 @@ void CS_EdgeGen(int2 pos)
         float D_s = ndS.a;
         float depthDiff = abs(D_c - D_s);
         
-        // 遠くの物体対策: 距離(D_c)に応じてしきい値を甘くする
+        // 遠距離補正: 遠くほど閾値を甘くして、遠景が真っ黒になるのを防ぐ
         float scaledThresh = threshDepth * (1.0 + D_c * DepthSens * 10.0);
         float dEdge = smoothstep(scaledThresh, scaledThresh * 2.0, depthDiff);
         
@@ -206,7 +212,7 @@ void CS_EdgeGen(int2 pos)
 
 // --------------------------------------------------------
 // Pass 1: Composite (PS)
-// 役割: 計算されたエッジ情報を、元の画面に合成して表示
+// 役割: ジャギーを低減(ぼかし処理)しながら画面に合成
 // --------------------------------------------------------
 // @pass: Composite (PS)
 // @read: WorkTex
@@ -214,9 +220,33 @@ void CS_EdgeGen(int2 pos)
 float4 PS_Composite(VSO vso)
 {
     float4 col = ScreenTexture.Sample(ClampSamp, vso.uv);
-    float4 edgeData = WorkTex.Sample(ClampSamp, vso.uv);
 
-    float intensity = edgeData.r;
+    // --- ジャギー対策: ソフトサンプリング ---
+    // 中心のエッジ強度
+    float intensity = WorkTex.Sample(ClampSamp, vso.uv).r;
+
+    // ぼかし半径: S(EdgeSoft)モーフで制御
+    // S=0.5 くらいで適度なアンチエイリアス効果が得られます
+    float blurRadius = EdgeSoft * 1.5;
+
+    if (blurRadius > 0.01) {
+        float2 pixelSize = 1.0 / Resolution; 
+
+        // 上下左右のピクセルをサンプリング
+        float iU = WorkTex.Sample(ClampSamp, vso.uv + float2(0, -pixelSize.y) * blurRadius).r;
+        float iD = WorkTex.Sample(ClampSamp, vso.uv + float2(0,  pixelSize.y) * blurRadius).r;
+        float iL = WorkTex.Sample(ClampSamp, vso.uv + float2(-pixelSize.x, 0) * blurRadius).r;
+        float iR = WorkTex.Sample(ClampSamp, vso.uv + float2( pixelSize.x, 0) * blurRadius).r;
+
+        // 中心重点平均 (Center:4, Neighbors:1)
+        // これにより、カクカクした線を少し滲ませます
+        intensity = (intensity * 4.0 + iU + iD + iL + iR) / 8.0;
+        
+        // ぼかすと全体的に薄くなるので、少し強度を持ち上げる
+        intensity = min(1.0, intensity * 1.2);
+    }
+
+    // 色と不透明度の適用
     float3 edgeColor = float3(EdgeR, EdgeG, EdgeB);
     
     // 不透明度(Tr)を適用
