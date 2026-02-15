@@ -1,0 +1,201 @@
+// desc: 2Dリムライト ブラー付き (CSでマスク生成)
+//
+// ==================================================================================
+//   【 2Dリムライト (ブラー付き) エフェクト説明書 / マニュアル 】
+// ==================================================================================
+//
+// ■ 概要
+//   カメラの視線と法線から輪郭のハイライトを計算した後、
+//   固定半径(5ピクセル)の「ぼかし(ブラー)処理」を加えるエフェクトです。
+//   ブラーなし版に比べて、ジャギー(ギザギザ)が緩和された柔らかい光のフチ取りになります。
+//
+// ■ 使いこなしのコツ
+//   1. 【ブラーなし版との使い分け】
+//      本エフェクトは、抽出したリムライトのマスク画像に固定幅のガウスぼかしを適用します。
+//      アニメ調の「くっきりした細い線」が欲しい場合はブラーなし版を、
+//      「少しにじんだような、柔らかい質感の光」が欲しい場合はこちらを使用してください。
+//   2. 【発光強度(RimInten)の役割】
+//      ブラー処理によって光は周囲に拡散し、全体のピーク輝度が下がって少し薄くなります。
+//      「Z (RimInten)」を上げると、ぼけた後の光の不透明度(濃さ)を補い、
+//      輪郭部分をしっかり白飛びさせる(白く飛ばす)ことができます。
+//      ※注意: 光の「広がる距離」自体はプログラム上5ピクセルで固定されているため、
+//      数値を上げても光のオーラが遠くまで伸びるわけではありません。
+//
+// ■ パラメータ(モーフ) 詳細一覧
+//
+// @morph: X = RimWidth
+//   [リムの幅/閾値] (0.0:極細 ～ 1.0:全体)
+//   光る範囲を決めます。0に近いほど輪郭スレスレのみ光り、1に近づくほど面全体が光ります。
+//
+// @morph: Y = RimSoft
+//   [境界のぼかし] (0.0:硬い ～ 1.0:柔らかい)
+//   光と影の境界のグラデーション幅です。数値を上げるとベースの光が柔らかくなります。
+//
+// @morph: Z = RimInten
+//   [発光強度]
+//   ブラーによる輝度低下を補うための倍率です。数値を上げるとより強く発光します。
+//
+// @morph: Rx = RimR
+// @morph: Ry = RimG
+// @morph: Rz = RimB
+//   [リムの色] (RGB)
+//   リムライトの色を指定します。
+//
+// @morph: Si = RimThrough
+//   [不透明度/透過] (0.0:透過しない(光る) ～ 1.0:完全に透過する(光らない))
+//   ※注意※ 値が「1.0」のときエフェクトが【無効(透明)】になります。
+//
+// ==================================================================================
+
+// --------------------------------------------------------
+// Pass 0: Compute Shader (CS)
+// 役割: 法線と視線から「エッジ度」を計算し、WorkTexに焼き込む
+// --------------------------------------------------------
+// @pass: MaskGen (CS)
+// @write: WorkTex
+#ifdef YRZ_PASS_MaskGen
+void CS_MaskGen(int2 pos)
+{
+    // 1. 初期化 (必須)
+    // CSでは書き込まれないピクセルに前回のゴミが残るのを防ぐためゼロクリアします。
+    WorkTex[pos] = float4(0, 0, 0, 0);
+
+    // 2. G-Bufferチェック
+    uint2 gb = GBuffer1[pos];
+
+    // 背景(Inai)以外なら計算
+    if (gb.r != Inai) {
+        // 3. 対象の材質かチェック (Generatorが生成したフラグ判定)
+        // FXLinkerのUIでチェックを入れた材質のみ処理します。
+        uint matID = Faces[NonUniformResourceIndex(gb.r)][gb.g];
+        uint bits = MaterialEffectBits[NonUniformResourceIndex(gb.r)][matID];
+        
+        if (bits & MY_BIT_FLAG) {
+            // 法線と深度を取得
+            float4 nd = NormalDepth[pos];
+            float3 N = normalize(nd.rgb);
+            
+            // ワールド座標復元 -> 視線ベクトル(V)計算
+            // ※Wrapper側で WorldPosFromDepth 関数が提供されている前提
+            float3 worldPos = WorldPosFromDepth(pos, nd.a);
+            float3 V = normalize(CameraPosition - worldPos);
+
+            // 4. リム計算 (NとVの内積)
+            // 1.0 - dot(N, V) は、正面(0)〜エッジ(1) になる
+            float rim = 1.0 - saturate(dot(N, V));
+
+            // 5. 幅とぼかしの制御
+            // smoothstep(min, max, x) を使うと綺麗に閾値処理できる
+            // RimWidth: 0.0(細い) ～ 1.0(太い) -> 閾値に変換
+            // RimSoft:  0.0(硬い) ～ 1.0(柔らかい)
+            float threshold = 1.0 - clamp(RimWidth, 0.01, 0.99);
+            // モーフ0で閾値1(光らない)、モーフ1で閾値0(全発光)
+            float soft = max(0.001, RimSoft * 0.5); // 0除算防止
+
+            // 閾値を超えたら光らせる
+            float intensity = smoothstep(threshold, threshold + soft, rim);
+
+            // 6. 強度を乗算して書き込み
+            intensity *= RimInten * 5.0; // 少し強めに補正
+
+            // Rチャンネルに強度を入れる
+            WorkTex[pos] = float4(intensity, 0, 0, 1);
+        }
+    }
+}
+#endif
+
+// --------------------------------------------------------
+// Pass 2: BlurX (CS)
+// 役割: WorkTex(生成されたマスク)を「横方向」にぼかしてTempTexに書き出す
+// 解説: 2次元のぼかしを一度に計算すると重いため、縦と横に分割(セパレート)して高速化しています。
+// --------------------------------------------------------
+// @pass: BlurX (CS)
+// @read: WorkTex
+// @write: TempTex
+#ifdef YRZ_PASS_BlurX
+void CS_BlurX(int2 pos)
+{
+    float4 color = float4(0,0,0,0);
+    float totalWeight = 0;
+    
+    // 簡易ガウシアンブラー (サンプリング半径5)
+    [unroll] // ループ展開による最適化指示
+    for(int i = -5; i <= 5; ++i) {
+        // 現在のピクセルから横(X軸方向)にずらしてサンプリング
+        int2 p = pos + int2(i, 0);
+
+        // 画面外クランプはSampler任せにできない(Loadなので)ためClamp
+        // 画面外にはみ出した場合は、端のピクセルを参照するようにします。
+        p = clamp(p, int2(0,0), int2(Resolution)-1);
+
+        // 重み(Weight)の計算: ガウス分布関数
+        // 中心(i=0)が最も重みが高く、離れるほど影響力が小さくなります (Sigma=2.0)
+        float weight = exp(-(i*i) / (2.0 * 4.0)); 
+        
+        // WorkTexはSRV(@read)として読めるので、重みを掛けて加算
+        color += WorkTex[p] * weight;
+        totalWeight += weight;
+    }
+    // 合計の重みで割ることで、明るさが破綻しないよう正規化してTempTexへ保存
+    TempTex[pos] = color / totalWeight;
+}
+#endif
+
+// --------------------------------------------------------
+// Pass 3: BlurY (CS)
+// 役割: TempTex(横にぼかした画像)を「縦方向」にぼかしてWorkTexに戻す
+// --------------------------------------------------------
+// @pass: BlurY (CS)
+// @read: TempTex
+// @write: WorkTex
+#ifdef YRZ_PASS_BlurY
+void CS_BlurY(int2 pos)
+{
+    float4 color = float4(0,0,0,0);
+    float totalWeight = 0;
+
+    [unroll]
+    for(int i = -5; i <= 5; ++i) {
+        // 現在のピクセルから縦(Y軸方向)にずらしてサンプリング
+        int2 p = pos + int2(0, i);
+        p = clamp(p, int2(0,0), int2(Resolution)-1);
+        
+        float weight = exp(-(i*i) / (2.0 * 4.0));
+        color += TempTex[p] * weight;
+        totalWeight += weight;
+    }
+    // 最終的なブラー結果をWorkTexに戻す
+    WorkTex[pos] = color / totalWeight;
+}
+#endif
+
+// --------------------------------------------------------
+// Pass 4: Composite (PS)
+// 役割: WorkTexのマスク強度を使って、画面にリムライトを加算
+// --------------------------------------------------------
+// @pass: Composite (PS)
+// @read: WorkTex
+#ifdef YRZ_PASS_Composite
+float4 PS_Composite(VSO vso)
+{
+    // 背景(元画像)と、ブラー処理されたリムライトマスクを取得
+	float4 col =  ScreenTexture.Sample(ClampSamp, vso.uv);
+	float4 csData = WorkTex.Sample(ClampSamp, vso.uv);
+
+    // CSで計算・ブラーされた強度 (Rチャンネル)
+    float intensity = csData.r;
+
+    // Si (RimThrough) による不透明度制御
+    // Si=1.0 -> alpha=0.0 (元の色のみ)
+    // Si=0.0 -> alpha=intensity (リム色のみ)
+    float alpha = intensity * (1.0 - saturate(RimThrough));
+
+    // モーフから色を作成 (Rx, Ry, Rz)
+    float3 rimColor = float3(RimR, RimG, RimB);
+
+    // 線形補間 (Alpha Blend)
+    // col(下地) と rimColor(上塗り) を alpha で混ぜる
+	return float4(lerp(col.rgb, rimColor, alpha), col.a);
+}
+#endif
