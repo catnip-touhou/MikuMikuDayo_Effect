@@ -1,0 +1,147 @@
+// desc: 2Dリムライト (CSでマスク生成)
+//
+// ==================================================================================
+//   【 2Dリムライト エフェクト説明書 / マニュアル 】
+// ==================================================================================
+//
+// ■ 概要
+//   カメラの視線とモデルの面の向き(法線)の角度を計算し、モデルの輪郭(フチ)が
+//   光っているように見せる「リムライト」エフェクトです。
+//
+// ■ 使いこなしのコツ
+//   1. 【逆光の演出】
+//      「X (RimWidth)」を少し大きめに設定し、「Y (RimSoft)」を上げることで、
+//      背後から強い光を浴びて回り込んでいるような逆光表現が作れます。
+//   2. 【材質ごとの適用】
+//      FXLinkerのUIで特定の材質（髪の毛や金属パーツなど）だけチェックを入れれば、
+//      その部分だけにハイライトを追加して質感を際立たせることができます。
+//   3. 【フェードイン・アウト】
+//      「Si (RimThrough)」をMMDayoのタイムライン上で動かすことで、
+//      特定フレームで一瞬だけピカッと光らせるようなアニメーションが可能です。
+//
+// ■ パラメータ(モーフ) 詳細一覧
+//
+// @morph: X = RimWidth
+//   [リムの幅/閾値] (0.0:極細 ～ 1.0:全体)
+//   光る範囲を決めます。0に近いほど輪郭スレスレのみ光り、1に近づくほど面全体が光ります。
+//
+// @morph: Y = RimSoft
+//   [境界のぼかし] (0.0:くっきり ～ 1.0:なめらか)
+//   光と影の境界のグラデーション幅です。数値を上げると柔らかい光になります。
+//
+// @morph: Z = RimInten
+//   [発光強度]
+//   光の強さ（明るさ）の倍率です。数値を上げるとより強く発光します。
+//
+// @morph: Rx = RimR
+// @morph: Ry = RimG
+// @morph: Rz = RimB
+//   [リムの色] (RGB)
+//   リムライトの色を指定します。
+//
+// @morph: Si = RimThrough
+//   [不透明度/透過] (0.0:透過しない(光る) ～ 1.0:完全に透過する(光らない))
+//   ※注意※ 値が「1.0」のときエフェクトが【無効(透明)】になります。
+//
+// ==================================================================================
+
+// --------------------------------------------------------
+// Pass 0: Compute Shader (CS)
+// 役割: 法線と視線から「エッジ度」を計算し、WorkTexに焼き込む
+// --------------------------------------------------------
+// @pass: MaskGen (CS)
+// @write: WorkTex
+#ifdef YRZ_PASS_MaskGen
+void CS_MaskGen(int2 pos)
+{
+    // 1. 初期化 (必須)
+    // 前フレームの計算結果などのゴミが残らないよう、必ずゼロクリアします。
+    WorkTex[pos] = float4(0, 0, 0, 0);
+
+    // 2. G-Bufferチェック
+    // 現在のピクセルに描画されているモデルのID等を取得します。
+    uint2 gb = GBuffer1[pos];
+
+    // 背景(Inai)以外なら計算を実行します。
+    if (gb.r != Inai) {
+        // 3. 対象の材質かチェック (Generatorが生成したフラグ判定)
+        // FXLinkerのUIでチェックが入れられている材質かどうかを調べます。
+        uint matID = Faces[NonUniformResourceIndex(gb.r)][gb.g];
+        uint bits = MaterialEffectBits[NonUniformResourceIndex(gb.r)][matID];
+        
+        // UIで有効に設定されている(MY_BIT_FLAGが立っている)場合のみ処理します。
+        if (bits & MY_BIT_FLAG) {
+            
+            // 4. 幾何情報の取得
+            // 法線(面の向き)と深度(カメラからの距離)を取得します。
+            float4 nd = NormalDepth[pos];
+            float3 N = normalize(nd.rgb); // 法線ベクトル
+            
+            // ワールド座標復元 -> 視線ベクトル(V)計算
+            // ※Wrapper側で WorldPosFromDepth 関数が提供されている前提
+            float3 worldPos = WorldPosFromDepth(pos, nd.a);
+            float3 V = normalize(CameraPosition - worldPos); // カメラからピクセルへ向かうベクトル
+
+            // 5. リム計算 (NとVの内積)
+            // dot(N, V) は、カメラと面が正対していると 1.0、真横を向いている(輪郭)と 0.0 になります。
+            // 1.0 から引くことで、正面(0.0) 〜 エッジ(1.0) という「輪郭度合い」に反転させます。
+            float rim = 1.0 - saturate(dot(N, V));
+
+            // 6. 幅とぼかしの制御
+            // smoothstep(min, max, x) を使うと綺麗に閾値処理できます。
+            // RimWidth(Xモーフ): 0.0(細い) ～ 1.0(太い) -> 計算用に閾値へ変換します。
+            // モーフ0で閾値1(ほとんど光らない)、モーフ1で閾値0(全発光)となります。
+            float threshold = 1.0 - clamp(RimWidth, 0.01, 0.99);
+
+            // RimSoft(Yモーフ): 0.0(硬い) ～ 1.0(柔らかい)
+            // 0除算によるエラーを防ぐため、最低でも 0.001 の幅を持たせます。
+            float soft = max(0.001, RimSoft * 0.5);
+
+            // 閾値を超えた部分を 0.0 〜 1.0 のグラデーションで光らせます。
+            float intensity = smoothstep(threshold, threshold + soft, rim);
+
+            // 7. 発光強度の適用
+            // 強度(Zモーフ)を乗算して書き込みます。
+            // 5.0 を掛けているのは、少し強めに補正して効果を分かりやすくするためです。
+            intensity *= RimInten * 5.0;
+
+            // Rチャンネルに強度を入れて保存します。
+            WorkTex[pos] = float4(intensity, 0, 0, 1);
+        }
+    }
+}
+#endif
+
+// --------------------------------------------------------
+// Pass 1: Composite (PS)
+// 役割: WorkTexに書き込まれた強度情報を元に、実際の画面色にリムライトを合成する
+// --------------------------------------------------------
+// @pass: Composite (PS)
+// @read: WorkTex
+#ifdef YRZ_PASS_Composite
+float4 PS_Composite(VSO vso)
+{
+    // 現在の画面の元の色を取得します。
+	float4 col =  ScreenTexture.Sample(ClampSamp, vso.uv);
+    // 先ほどCSパスで計算したリムライトのマスク画像を取得します。
+	float4 csData = WorkTex.Sample(ClampSamp, vso.uv);
+
+    // CSで計算した発光強度 (Rチャンネル)
+    float intensity = csData.r;
+
+    // 1. 不透明度の計算
+    // Si (RimThrough) による不透明度制御
+    // Si=1.0 -> alpha=0.0 (元の色のみ、リムライトは見えない)
+    // Si=0.0 -> alpha=intensity (計算された強度がそのまま反映される)
+    float alpha = intensity * (1.0 - saturate(RimThrough));
+
+    // 2. リムライトの色を作成
+    // モーフからRGBの各成分を取得します。(Rx, Ry, Rz)
+    float3 rimColor = float3(RimR, RimG, RimB);
+
+    // 3. 画面への合成 (線形補間: lerp)
+    // col.rgb(元の画面の色) と rimColor(モーフで決めた色) を、
+    // alpha(最終的な発光強度) の割合で混ぜ合わせます。
+	return float4(lerp(col.rgb, rimColor, alpha), col.a);
+}
+#endif
