@@ -1,0 +1,155 @@
+// desc: ワイヤーフレーム HDR対応版 (重心座標ベース)
+//
+// ==================================================================================
+//   【 ワイヤーフレーム HDR対応版 エフェクト説明書 / マニュアル 】
+// ==================================================================================
+//
+// ■ 概要
+//   G-Bufferの「重心座標」を利用してポリゴンの網目を描画するエフェクトです。
+//   1.0を超えるHDR発光（Bloom連動）に対応しています。
+//
+// ■ 使いこなしのコツ
+//   1. 【極細線のチューニング】
+//      「X (WireWidth)」の感度を極細寄りに調整しています。
+//      0.01 ～ 0.1 あたりの低い数値で、非常にシャープで細い線を出すことができます。
+//      細くしすぎて線が途切れる（ジャギーが出る）場合は、「Y (WireSoft)」を
+//      ほんの少しだけ上げて馴染ませてください。
+//   2. 【Bloom（発光）エフェクトとの連携】
+//      「AL」モーフを上げると、線のRGB値が通常の最大値(1.0)を超えて増幅されます。
+//      後段にBloomエフェクトを配置している場合、ALを 0.5 ～ 1.0 に上げることで、
+//      ワイヤーフレームだけがネオンサインのように強く発光して周囲に光が溢れ出します。
+//   3. 【ホログラム風の透過表現】
+//      「Si (WireThrough)」を少し上げて下地（元のテクスチャ）を透けさせると、
+//      空間に浮かぶデジタルUIのような表現になります。
+//
+// ■ パラメータ(モーフ) 詳細一覧
+//
+// @morph: X = WireWidth
+//   [線の太さ] (0.0:極細 ～ 1.0:太い)
+//   ワイヤーフレームの線の太さを決定します。
+//
+// @morph: Y = WireSoft
+//   [線のぼかし/アンチエイリアス] (0.0:くっきり ～ 1.0:なめらか)
+//   線の輪郭の柔らかさを調整します。
+//
+// @morph: Z = WireInten
+//   [線の濃さ/不透明度]
+//   線のベースとなる不透明度の倍率です。(※物理的な光の強さはALで制御します)
+//
+// @morph: Rx = WireR
+// @morph: Ry = WireG
+// @morph: Rz = WireB
+//   [線の色] (RGB)
+//   ワイヤーフレームのベースカラーを指定します。
+//
+// @morph: Si = WireThrough
+//   [ベースの透過度] (0.0:線のみ加算 ～ 1.0:完全に透明になり無効化)
+//   元のテクスチャの色をどれくらい残すかを制御します。
+//
+// @morph: AL = WireAL
+//   [HDR発光強度 / AutoLuminous] (0.0:通常 ～ 1.0:超高輝度)
+//   線のRGB値を1.0以上にブーストします。Bloomエフェクトで光を溢れさせるためのパラメータです。
+//
+// ==================================================================================
+
+// --------------------------------------------------------
+// Pass 0: Compute Shader (CS)
+// 役割: 重心座標からポリゴンのエッジ(境界)を検出し、線をWorkTexに書き込む
+// --------------------------------------------------------
+// @pass: WireGen (CS)
+// @write: WorkTex
+#ifdef YRZ_PASS_WireGen
+void CS_WireGen(int2 pos)
+{
+    // 1. 初期化 (必須)
+    // CSでは書き込まれないピクセルに前回のゴミが残るのを防ぐためゼロクリアします。
+    WorkTex[pos] = float4(0, 0, 0, 0);
+
+    // 2. G-Bufferチェック
+    uint2 gb = GBuffer1[pos];
+
+    // 背景(Inai)以外なら計算
+    if (gb.r != Inai) {
+        // 3. 対象の材質かチェック (FXLinkerのUI設定を反映)
+        uint matID = Faces[NonUniformResourceIndex(gb.r)][gb.g];
+        uint bits = MaterialEffectBits[NonUniformResourceIndex(gb.r)][matID];
+        
+        // UIで有効に設定されている場合のみ処理します。
+        if (bits & MY_BIT_FLAG) {
+            
+            // 4. 重心座標の取得と復元
+            // MikuMikuDayoのGBuffer2には、ポリゴン内の位置を示す重心座標(u, v)が入っています。
+            // 重心座標は3つの頂点からの重み(u, v, w)で表され、u + v + w = 1.0 となります。
+            float2 bary = GBuffer2[pos];
+            
+            // 残りの1成分(w)を計算して、3成分揃えたベクトルを作ります。
+            float3 st = float3(bary.x, bary.y, 1.0 - bary.x - bary.y);
+            
+            // 5. エッジ(ポリゴンの境界)までの距離を計算
+            // ポリゴンのフチ(境界線)では、u, v, w のいずれかが 0 になります。
+            // したがって、3つの成分のうち「最も小さい値」が、最も近いエッジまでの距離になります。
+            float dist = min(min(st.x, st.y), st.z);
+
+            // 6. 線の太さとぼかしの計算
+            // 【変更点】WireWidth を2乗し、さらに係数を0.03と小さくすることで、
+            // 「極細の線」の微調整がしやすくなるようなカーブにしています。
+            float threshold = max(0.00001, (WireWidth * WireWidth) * 0.03);
+            
+            // ぼかし(アンチエイリアス)幅も細線に合わせてスケールを小さくしています。
+            float soft = max(0.00001, WireSoft * 0.03);
+
+            // smoothstep を使って、エッジ付近(distが0に近い場所)だけを 1.0 にして線を引きます。
+            // distが threshold より小さければ 1.0(完全な線)、threshold + soft より大きければ 0.0(背景) になります。
+            float intensity = 1.0 - smoothstep(threshold, threshold + soft, dist);
+
+            // 7. ベース濃度の適用
+            // Z(WireInten) モーフで線の「不透明度/濃さ」をブーストします。
+            intensity *= WireInten * 5.0;
+
+            // Rチャンネルに線の強度を入れて保存します。
+            WorkTex[pos] = float4(intensity, 0, 0, 1);
+        }
+    }
+}
+#endif
+
+// --------------------------------------------------------
+// Pass 1: Composite (PS)
+// 役割: WorkTexのワイヤーフレーム強度と色を、HDR発光させて画面に合成する
+// --------------------------------------------------------
+// @pass: Composite (PS)
+// @read: WorkTex
+#ifdef YRZ_PASS_Composite
+float4 PS_Composite(VSO vso)
+{
+    // 現在の画面の元の色を取得します。
+	float4 col = ScreenTexture.Sample(ClampSamp, vso.uv);
+    // 先ほどCSパスで計算したワイヤーフレームのマスク画像を取得します。
+	float4 csData = WorkTex.Sample(ClampSamp, vso.uv);
+
+    // CSで計算した線のベース強度 (Rチャンネル)
+    float intensity = csData.r;
+
+    // 1. 不透明度の計算
+    // Si (WireThrough) による不透明度制御
+    // Si=1.0 -> alpha=0.0 (元の色のみ、ワイヤーは見えない)
+    // Si=0.0 -> alpha=intensity (計算されたワイヤーの強度がそのまま反映される)
+    float alpha = intensity * (1.0 - saturate(WireThrough));
+
+    // 2. 線の基本色を作成
+    // モーフからRGBの各成分を取得します。(Rx, Ry, Rz)
+    float3 baseWireColor = float3(WireR, WireG, WireB);
+
+    // 3. 【追加】HDR発光 (Bloom連動) の計算
+    // ALモーフを使って、色の値を1.0以上にブーストします。
+    // AL=0.0 の時は 1.0倍(通常の色)
+    // AL=1.0 の時は 20.0倍 などの大きな値になり、ブルームエフェクトが反応して光が溢れます。
+    float hdrMultiplier = 1.0 + (WireAL * 20.0);
+    float3 finalWireColor = baseWireColor * hdrMultiplier;
+
+    // 4. 画面への合成 (線形補間: lerp)
+    // col(元の画面の色) と finalWireColor(HDRブーストされた色) を、
+    // alpha(線のベース強度) の割合で混ぜ合わせます。
+	return float4(lerp(col.rgb, finalWireColor, alpha), col.a);
+}
+#endif
