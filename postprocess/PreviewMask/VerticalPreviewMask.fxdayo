@@ -1,0 +1,94 @@
+﻿[YRZFX]
+{
+    "fx": {
+        "cereal_class_version": 0,
+        "category" : "postprocess",
+        "controllers": [
+            { "name":"C_Opacity", "type":"float", "controllerName":"(self)", "item":"Opacity",
+                "slider":{"def":0.8, "min":0.0, "max":1.0},
+                "desc":["Adjusts the opacity of the mask outside the 9:16 area","9:16領域外のマスクの濃さを調整します"] },
+            { "name":"C_ColorR", "type":"float", "controllerName":"(self)", "item":"ColorR",
+                "slider":{"def":0.0, "min":0.0, "max":1.0} },
+            { "name":"C_ColorG", "type":"float", "controllerName":"(self)", "item":"ColorG",
+                "slider":{"def":0.0, "min":0.0, "max":1.0} },
+            { "name":"C_ColorB", "type":"float", "controllerName":"(self)", "item":"ColorB",
+                "slider":{"def":0.0, "min":0.0, "max":1.0} }
+        ],
+        "passes": [
+            { "name":"Pass", "type":"postprocess", "vertexShader":"VS", "pixelShader":"PS" }
+        ]
+    }
+}
+[HLSL]
+#include <resources_pp.hlsli>
+#include <yrz.hlsli>
+using namespace Dayo;
+using namespace YRZ;
+
+// UIからの入力を受け取る
+// Opacity: 0.0で完全に透明、1.0で完全に塗りつぶし
+static float Opacity = saturate(C_Opacity);
+static float3 MaskColor = saturate(float3(C_ColorR, C_ColorG, C_ColorB));
+
+struct VSO {
+    float4 pos:SV_POSITION;
+    float2 uv:TEXCOORD;
+};
+
+// -----------------------------------------------------------------------------
+// [頂点シェーダ]
+// 画面全体を覆う四角形（フルスクリーンカッド）を描画するための標準的なパススルー処理
+// -----------------------------------------------------------------------------
+VSO VS( float4 pos : POSITION, float2 uv:TEXCOORD )
+{
+    VSO vso = (VSO)0;
+    vso.pos = pos;
+    vso.uv = uv;
+    return vso;
+}
+
+// -----------------------------------------------------------------------------
+// [ピクセルシェーダ]
+// 描画されるピクセルが中央の9:16領域に収まっているかを判定し、外側ならマスクを乗算する
+// -----------------------------------------------------------------------------
+float4 PS(VSO vso) : SV_TARGET
+{
+    // 現在処理しているピクセルの物理座標（x, y）を取得
+    int2 pix = vso.pos.xy;
+    
+    // 現在の画面のピクセルカラーを無加工で取得（サンプラを通さないため高速）
+    float4 I = ScreenTexture[pix];
+
+    // -----------------------------------------------------------------
+    // 【判定領域の計算】
+    // 縦ピクセル数（Resolution.y）を基準にして、アスペクト比9:16の「横ピクセル数」を計算します。
+    // 例: 縦が1080pxなら、ターゲットの横幅は 1080 * (9/16) = 607.5px になります。
+    // -----------------------------------------------------------------
+    float targetWidth = (float)Resolution.y * (9.0 / 16.0);
+
+    // 画面全体の横幅からターゲット横幅を引き、左右に均等に振り分けるための余白（マージン）を計算
+    float marginX = ((float)Resolution.x - targetWidth) * 0.5;
+
+    // -----------------------------------------------------------------
+    // 【マスク判定】
+    // 現在のピクセルのX座標が、左マージンより小さいか、右マージンより大きい場合は
+    // 9:16領域の「外側（isOutside = true）」と判定します。
+    // -----------------------------------------------------------------
+    bool isOutside = ((float)pix.x < marginX) || ((float)pix.x > ((float)Resolution.x - marginX));
+
+    // [Tips] 万が一、MikuMikuDayoのウィンドウ自体が9:16より極端に細長くなった場合
+    // marginXはマイナスになり、isOutsideは常にfalse（マスクなし）になります。
+    // 縦長プレビュー用途としては安全にフォールバックする挙動としています。
+
+    [branch]
+    if (isOutside) {
+        // -----------------------------------------------------------------
+        // 【マスクの合成（アルファブレンド）】
+        // 元のピクセル色（I.rgb）と指定されたマスク色（MaskColor）を、
+        // 不透明度（Opacity）を係数にして線形補間（lerp）します。
+        // -----------------------------------------------------------------
+        I.rgb = lerp(I.rgb, MaskColor, Opacity);
+    }
+
+    return float4(I.rgb, 1.0);
+}
