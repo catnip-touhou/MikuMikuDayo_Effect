@@ -90,5 +90,5 @@ float4 PS(VSO vso) : SV_TARGET
         I.rgb = lerp(I.rgb, MaskColor, Opacity);
     }
 
-    return float4(I.rgb, 1.0);
+    return float4(I.rgb, I.a);
 }
